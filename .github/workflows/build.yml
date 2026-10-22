@@ -20,48 +20,45 @@ jobs:
           echo "SDK = $SDK"
           echo "SDK_VERSION = $(xcrun --sdk iphoneos --show-sdk-version)"
 
-      - name: Compile dylib
+      - name: Compile dylibs
         run: |
           set -euo pipefail
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           mkdir -p out
 
-          xcrun --sdk iphoneos clang \
-            -dynamiclib \
-            -arch arm64 \
-            -isysroot "$SDK" \
-            -miphoneos-version-min=15.0 \
-            -fobjc-arc \
-            -O2 \
-            -Wall \
-            -Wno-deprecated-declarations \
-            -Wno-unused-function \
-            -framework UIKit \
-            -framework Foundation \
-            -install_name @rpath/RotateProbe.dylib \
-            -o out/RotateProbe.dylib \
-            src/RotateProbe.m
+          for NAME in RotateProbe RotateFix; do
+            echo "===== building $NAME ====="
+            xcrun --sdk iphoneos clang \
+              -dynamiclib \
+              -arch arm64 \
+              -isysroot "$SDK" \
+              -miphoneos-version-min=15.0 \
+              -fobjc-arc \
+              -O2 \
+              -Wall \
+              -Wno-deprecated-declarations \
+              -Wno-unused-function \
+              -framework UIKit \
+              -framework Foundation \
+              -install_name "@rpath/$NAME.dylib" \
+              -o "out/$NAME.dylib" \
+              "src/$NAME.m"
+          done
 
       - name: Ad-hoc sign and verify
         run: |
           set -euo pipefail
-          codesign --force --sign - --timestamp=none out/RotateProbe.dylib
-
-          echo "--- lipo ---"
-          lipo -info out/RotateProbe.dylib
-
-          echo "--- linked libraries (must NOT contain substrate) ---"
-          otool -L out/RotateProbe.dylib
-
-          echo "--- codesign ---"
-          codesign -dv out/RotateProbe.dylib 2>&1 || true
-
-          echo "--- size ---"
-          ls -lh out/RotateProbe.dylib
+          for F in out/*.dylib; do
+            codesign --force --sign - --timestamp=none "$F"
+            echo "--- $F ---"
+            lipo -info "$F"
+            otool -L "$F"
+          done
+          ls -lh out
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: RotateProbe-dylib
-          path: out/RotateProbe.dylib
+          name: rotate-dylibs
+          path: out/*.dylib
           if-no-files-found: error
