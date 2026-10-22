@@ -156,9 +156,17 @@ static NSString *probeBuildReport(UIWindow *w) {
     [s appendFormat:@"win %.0fx%.0f @%.1fx\n",
      w.bounds.size.width, w.bounds.size.height, scale];
 
-    // App 级：delegate / UIApplication 覆盖值，优先级高于 VC
-    UIInterfaceOrientationMask appMask = [app supportedInterfaceOrientationsForWindow:w];
-    [s appendFormat:@"app  %@\n", probeMaskString(appMask)];
+    // App 级：走公开的 delegate 方法。这是系统实际调用的路径，
+    // 且 UIApplication 类上并没有公开声明 supportedInterfaceOrientationsForWindow:，
+    // 直接对 app 发该消息无法通过编译。
+    UIInterfaceOrientationMask appMask = UIInterfaceOrientationMaskAll;
+    NSString *appMaskSource = @"none";
+    id<UIApplicationDelegate> del = app.delegate;
+    if ([del respondsToSelector:@selector(application:supportedInterfaceOrientationsForWindow:)]) {
+        appMask = [del application:app supportedInterfaceOrientationsForWindow:w];
+        appMaskSource = @"delegate";
+    }
+    [s appendFormat:@"app  %@ (%@)\n", probeMaskString(appMask), appMaskSource];
     [s appendFormat:@"plist %@\n", probePlistOrientations()];
 
     // 页面级：整条容器链
