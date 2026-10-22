@@ -41,6 +41,7 @@ jobs:
               -framework UIKit \
               -framework Foundation \
               -framework CoreGraphics \
+              -framework AVFoundation \
               -install_name "@rpath/$NAME.dylib" \
               -o "out/$NAME.dylib" \
               "src/$NAME.m"
