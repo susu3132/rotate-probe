@@ -98,8 +98,8 @@ static NSArray<UIViewController *> *probeVCChainFrom(UIWindow *w) {
             next = ((UINavigationController *)vc).topViewController;
         } else if ([vc isKindOfClass:[UITabBarController class]]) {
             next = ((UITabBarController *)vc).selectedViewController;
-        } else if (vc.children.count > 0) {
-            next = vc.children.lastObject;
+        } else if (vc.childViewControllers.count > 0) {
+            next = vc.childViewControllers.lastObject;
         }
 
         if (!next || next == vc) break;
