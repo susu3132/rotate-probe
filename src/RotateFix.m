@@ -1,21 +1,22 @@
 //
-//  RotateFix.m  --  阶段 1：让红果读书页可自由旋转
+//  RotateFix.m  --  阶段 1 / 0.3：红果自由旋转
 //
-//  探测结论（来自阶段 0 实测）：
-//    plist 只声明 P，但 AppDelegate 的 application:supportedInterfaceOrientationsForWindow:
-//    返回 0x1a（P|LL|LR），且视频页实测能横屏 -> 第一道闸门不是障碍
+//  探测结论（阶段 0 实测）：
+//    plist 只声明 P，但 AppDelegate 返回 0x1a（P|LL|LR），视频页实测能横屏
+//    -> delegate 覆盖 plist，不必改 Info.plist
 //
-//    读书页 VC 链：
-//      0 SSRootViewController          0x02 P auto=0   <- 真正的闸门（根容器）
-//      1 BDRReaderViewController       0x02 P auto=0
-//      2 BDSlideViewController         0x02 P auto=0
-//      3 BDRTextContentViewController  0x02 P auto=0
+//    读书页：SSRootViewController(0x02 auto=0) -> BDRReaderViewController
+//            -> BDSlideViewController -> BDRTextContentViewController  全锁竖屏
+//    视频页：FQVShortVideoListViewController(0x02 auto=0) 锁竖屏
+//            FQVShortVideoLandscapeViewController(0x18 auto=1) 本来就能横屏
 //
-//    视频页能以 0x18 横屏，是因为它以全屏 modal 呈现，系统查询的是 modal 而非 root。
-//    读书页是 root 的子 VC，系统只问 root，所以只 hook BDR 三层无效。
+//    真正的闸门是根容器 SSRootViewController —— 子 VC 被它锁住，系统只问 root。
 //
-//  策略：读书页活跃时，把上述四类的 mask 放开到 0x1a、autorotate 置 YES。
-//        不做强制旋转，交给重力感应自然跟随。
+//  0.3 变更：
+//    1. 放开范围增加 FQVShortVideoListViewController（竖版短视频，居中两侧黑边）
+//    2. hook 分项计数 + 定时重试（应对阅读器 framework 懒加载）
+//    3. 浮层打印 BDRText 子树，用于判断文本容器类型与尺寸
+//    4. 横屏时把文本块水平居中（transform 平移，不动约束、不影响分页）
 //
 //  编译：见 .github/workflows/build.yml（macOS + Xcode SDK 交叉编译，不依赖 Theos / substrate）
 //
@@ -26,9 +27,14 @@
 
 #pragma mark - 状态
 
-static BOOL gEnabled = YES;      // 总开关（双击浮层切换）
-static BOOL gReaderActive = NO;  // 读书页活跃标志（viewDidAppear / viewWillDisappear 维护）
-static int  gHookedCount = 0;    // 成功安装的 hook 数量，用于自检
+#define HOOK_SLOTS 5
+
+static BOOL gEnabled = YES;
+static BOOL gReaderActive = NO;
+
+static int  gHookCounts[HOOK_SLOTS] = {0};
+static BOOL gMaskDone[HOOK_SLOTS]    = {NO};
+static BOOL gAutoDone[HOOK_SLOTS]    = {NO};
 
 typedef UIInterfaceOrientationMask (*MaskFn)(id, SEL);
 typedef BOOL (*BoolFn)(id, SEL);
@@ -36,34 +42,65 @@ typedef void (*AppearFn)(id, SEL, BOOL);
 
 #pragma mark - 页面判定
 
-// 递归检查 VC 链里是否有 BDR 前缀的类。深度限制防止异常结构导致栈溢出。
-static BOOL hasReaderInChain(UIViewController *vc, int depth) {
-    if (!vc || depth > 6) return NO;
+static NSString *classNameForIndex(int idx) {
+    switch (idx) {
+        case 0: return @"SSRootViewController";
+        case 1: return @"BDRReaderViewController";
+        case 2: return @"BDSlideViewController";
+        case 3: return @"BDRTextContentViewController";
+        case 4: return @"FQVShortVideoListViewController";
+        default: return nil;
+    }
+}
 
+// 该 VC 是否是「需要放开旋转」的页面
+static BOOL isRelaxTargetVC(UIViewController *vc) {
     NSString *name = NSStringFromClass([vc class]) ?: @"";
     if ([name hasPrefix:@"BDR"]) return YES;
+    if ([name isEqualToString:@"FQVShortVideoListViewController"]) return YES;
+    return NO;
+}
+
+// 递归查找目标页面
+static BOOL hasRelaxTargetInChain(UIViewController *vc, int depth) {
+    if (!vc || depth > 6) return NO;
+    if (isRelaxTargetVC(vc)) return YES;
 
     for (UIViewController *child in vc.childViewControllers) {
-        if (hasReaderInChain(child, depth + 1)) return YES;
+        if (hasRelaxTargetInChain(child, depth + 1)) return YES;
     }
-    if (vc.presentedViewController && hasReaderInChain(vc.presentedViewController, depth + 1)) {
+    if (vc.presentedViewController && hasRelaxTargetInChain(vc.presentedViewController, depth + 1)) {
         return YES;
     }
     return NO;
 }
 
-// 是否需要为 self 放开方向限制
 static BOOL shouldRelax(id self) {
     if (!gEnabled) return NO;
     if (gReaderActive) return YES;
 
-    NSString *name = NSStringFromClass([self class]) ?: @"";
-    if ([name hasPrefix:@"BDR"]) return YES;
-
     if ([self isKindOfClass:[UIViewController class]]) {
-        return hasReaderInChain((UIViewController *)self, 0);
+        UIViewController *vc = (UIViewController *)self;
+        if (isRelaxTargetVC(vc)) return YES;
+        return hasRelaxTargetInChain(vc, 0);
     }
     return NO;
+}
+
+// 按类名片段查找 VC
+static UIViewController *findVCContaining(UIViewController *vc, NSString *frag, int depth) {
+    if (!vc || depth > 8) return nil;
+    NSString *name = NSStringFromClass([vc class]) ?: @"";
+    if ([name containsString:frag]) return vc;
+
+    for (UIViewController *child in vc.childViewControllers) {
+        UIViewController *r = findVCContaining(child, frag, depth + 1);
+        if (r) return r;
+    }
+    if (vc.presentedViewController) {
+        return findVCContaining(vc.presentedViewController, frag, depth + 1);
+    }
+    return nil;
 }
 
 #pragma mark - hook 定义
@@ -90,32 +127,68 @@ DEF_MASK(SLIDE)
 DEF_AUTO(SLIDE)
 DEF_MASK(TEXT)
 DEF_AUTO(TEXT)
+DEF_MASK(VIDEO)
+DEF_AUTO(VIDEO)
 
-// 为单个类安装 mask + autorotate 两个 hook
-#define INSTALL_PAIR(NAME, CLSSTR) do { \
-    Class c = NSClassFromString(@CLSSTR); \
-    if (c) { \
-        Method mm = class_getInstanceMethod(c, @selector(supportedInterfaceOrientations)); \
-        if (mm) { \
-            gOrigMask_##NAME = method_getImplementation(mm); \
-            class_replaceMethod(c, @selector(supportedInterfaceOrientations), \
-                                (IMP)gHookMask_##NAME, method_getTypeEncoding(mm)); \
-            gHookedCount++; \
-        } \
-        Method ma = class_getInstanceMethod(c, @selector(shouldAutorotate)); \
-        if (ma) { \
-            gOrigAuto_##NAME = method_getImplementation(ma); \
-            class_replaceMethod(c, @selector(shouldAutorotate), \
-                                (IMP)gHookAuto_##NAME, method_getTypeEncoding(ma)); \
-            gHookedCount++; \
-        } \
-    } \
-} while (0)
+static IMP *gOrigMaskSlots[HOOK_SLOTS] = {
+    &gOrigMask_ROOT, &gOrigMask_READER, &gOrigMask_SLIDE, &gOrigMask_TEXT, &gOrigMask_VIDEO
+};
+static IMP *gOrigAutoSlots[HOOK_SLOTS] = {
+    &gOrigAuto_ROOT, &gOrigAuto_READER, &gOrigAuto_SLIDE, &gOrigAuto_TEXT, &gOrigAuto_VIDEO
+};
+static IMP gHookMaskFns[HOOK_SLOTS] = {
+    (IMP)gHookMask_ROOT, (IMP)gHookMask_READER, (IMP)gHookMask_SLIDE,
+    (IMP)gHookMask_TEXT, (IMP)gHookMask_VIDEO
+};
+static IMP gHookAutoFns[HOOK_SLOTS] = {
+    (IMP)gHookAuto_ROOT, (IMP)gHookAuto_READER, (IMP)gHookAuto_SLIDE,
+    (IMP)gHookAuto_TEXT, (IMP)gHookAuto_VIDEO
+};
+
+// 安装单类 hook。类不存在或已装好时直接返回，可在定时器里反复调用做补挂。
+static void installPair(int idx) {
+    if (idx < 0 || idx >= HOOK_SLOTS) return;
+    if (gMaskDone[idx] && gAutoDone[idx]) return;
+
+    NSString *name = classNameForIndex(idx);
+    if (!name) return;
+
+    Class c = NSClassFromString(name);
+    if (!c) return;
+
+    if (!gMaskDone[idx]) {
+        Method mm = class_getInstanceMethod(c, @selector(supportedInterfaceOrientations));
+        if (mm) {
+            *gOrigMaskSlots[idx] = method_getImplementation(mm);
+            class_replaceMethod(c, @selector(supportedInterfaceOrientations),
+                                gHookMaskFns[idx], method_getTypeEncoding(mm));
+            gMaskDone[idx] = YES;
+            gHookCounts[idx]++;
+        }
+    }
+    if (!gAutoDone[idx]) {
+        Method ma = class_getInstanceMethod(c, @selector(shouldAutorotate));
+        if (ma) {
+            *gOrigAutoSlots[idx] = method_getImplementation(ma);
+            class_replaceMethod(c, @selector(shouldAutorotate),
+                                gHookAutoFns[idx], method_getTypeEncoding(ma));
+            gAutoDone[idx] = YES;
+            gHookCounts[idx]++;
+        }
+    }
+}
+
+static int totalHooks(void) {
+    int n = 0;
+    for (int i = 0; i < HOOK_SLOTS; i++) n += gHookCounts[i];
+    return n;
+}
 
 #pragma mark - 读书页进出
 
 static IMP gOrigReaderAppear = NULL;
 static IMP gOrigReaderDisappear = NULL;
+static BOOL gLifecycleHooked = NO;
 
 static void gHookReaderAppear(id self, SEL _cmd, BOOL animated) {
     gReaderActive = YES;
@@ -128,6 +201,8 @@ static void gHookReaderDisappear(id self, SEL _cmd, BOOL animated) {
 }
 
 static void installReaderLifecycle(void) {
+    if (gLifecycleHooked) return;
+
     Class rc = NSClassFromString(@"BDRReaderViewController");
     if (!rc) return;
 
@@ -143,17 +218,47 @@ static void installReaderLifecycle(void) {
         class_replaceMethod(rc, @selector(viewWillDisappear:),
                             (IMP)gHookReaderDisappear, method_getTypeEncoding(m2));
     }
+    gLifecycleHooked = YES;
 }
 
-static void installAllHooks(void) {
-    INSTALL_PAIR(ROOT,   "SSRootViewController");
-    INSTALL_PAIR(READER, "BDRReaderViewController");
-    INSTALL_PAIR(SLIDE,  "BDSlideViewController");
-    INSTALL_PAIR(TEXT,   "BDRTextContentViewController");
-    installReaderLifecycle();
+#pragma mark - 布局：文本块水平居中
+
+// 找面积最大的 UITextView / UILabel
+static UIView *findLargestText(UIView *root, UIView *best, int depth) {
+    if (!root || depth > 7) return best;
+
+    if ([root isKindOfClass:[UITextView class]] || [root isKindOfClass:[UILabel class]]) {
+        CGFloat area = root.bounds.size.width * root.bounds.size.height;
+        CGFloat bestArea = best ? (best.bounds.size.width * best.bounds.size.height) : -1.0;
+        if (area > bestArea) best = root;
+    }
+    for (UIView *sub in root.subviews) {
+        best = findLargestText(sub, best, depth + 1);
+    }
+    return best;
 }
 
-#pragma mark - 浮层（调试用，双击切换总开关）
+// 横屏时把文本块水平居中。用 transform 平移，不动约束，翻页逻辑不受影响。
+static void applyHorizontalCentering(UIWindow *w) {
+    if (!gEnabled) return;
+    if (w.bounds.size.width <= w.bounds.size.height) return;  // 仅横屏
+
+    UIViewController *reader = findVCContaining(w.rootViewController, @"BDRText", 0);
+    if (!reader || !reader.view) return;
+
+    UIView *text = findLargestText(reader.view, nil, 0);
+    if (!text) return;
+
+    CGRect inWindow = [text convertRect:text.bounds toView:w];
+    if (inWindow.size.width <= 1.0) return;
+
+    CGFloat dx = (w.bounds.size.width - inWindow.size.width) / 2.0 - inWindow.origin.x;
+    if (dx > -1.0 && dx < 1.0) return;
+
+    text.transform = CGAffineTransformMakeTranslation(dx, 0.0);
+}
+
+#pragma mark - 浮层
 
 static UILabel *gLabel = nil;
 static NSTimer *gTimer = nil;
@@ -231,8 +336,8 @@ static void setupLabel(UIWindow *w) {
 
     UILabel *l = [[UILabel alloc] init];
     l.numberOfLines = 0;
-    l.font = [UIFont fontWithName:@"Menlo" size:10.0]
-             ?: [UIFont monospacedSystemFontOfSize:10.0 weight:UIFontWeightRegular];
+    l.font = [UIFont fontWithName:@"Menlo" size:9.0]
+             ?: [UIFont monospacedSystemFontOfSize:9.0 weight:UIFontWeightRegular];
     l.textColor = [UIColor whiteColor];
     l.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.78];
     l.layer.cornerRadius = 5.0;
@@ -255,9 +360,33 @@ static void setupLabel(UIWindow *w) {
     attachLabel(w);
 }
 
+// 广度优先描述子树，最多 maxItems 个节点
+static NSString *describeSubtree(UIView *root, int maxItems) {
+    if (!root) return @"(nil)";
+
+    NSMutableArray<NSString *> *lines = [NSMutableArray array];
+    NSMutableArray<UIView *> *queue = [NSMutableArray arrayWithObject:root];
+    int n = 0;
+
+    while (queue.count > 0 && n < maxItems) {
+        UIView *v = queue.firstObject;
+        [queue removeObjectAtIndex:0];
+        [lines addObject:[NSString stringWithFormat:@"%@ %.0fx%.0f",
+                          NSStringFromClass([v class]),
+                          v.frame.size.width, v.frame.size.height]];
+        for (UIView *sub in v.subviews) [queue addObject:sub];
+        n++;
+    }
+    return [lines componentsJoinedByString:@"\n"];
+}
+
 static void tickLabel(void) {
     UIWindow *w = fixKeyWindow();
     if (!w) return;
+
+    // 懒加载的类在这里补挂
+    for (int i = 0; i < HOOK_SLOTS; i++) installPair(i);
+    installReaderLifecycle();
 
     if (!gLabel) setupLabel(w);
     if (!gLabel) return;
@@ -270,16 +399,28 @@ static void tickLabel(void) {
 
     CGFloat maxWidth = w.bounds.size.width - 4.0;
     if (maxWidth < 120.0) maxWidth = 120.0;
-    gWidthConstraint.constant = MIN(320.0, maxWidth);
+    gWidthConstraint.constant = MIN(330.0, maxWidth);
+
+    // 每次刷新都尝试居中。函数内部会算 dx，已居中时 dx≈0 直接返回，
+    // 这样先横屏再进读书页、或 Auto Layout 重排后偏移失效的情况都能被纠正。
+    applyHorizontalCentering(w);
+
+    UIViewController *reader = findVCContaining(w.rootViewController, @"BDRText", 0);
+    NSString *tree = reader ? describeSubtree(reader.view, 5) : @"(不在读书页)";
 
     NSString *text = [NSString stringWithFormat:
-        @"RotateFix 0.1  2tap:on/off\n"
-        @"hook %d/8   state %@\n"
-        @"reader %@   win %.0fx%.0f",
-        gHookedCount,
-        gEnabled ? @"ON" : @"OFF",
+        @"RotateFix 0.3  2tap:on/off\n"
+        @"hook %d/10  %@  reader %@\n"
+        @"SSRoot%d BDRRead%d BDSlide%d\n"
+        @"BDRText%d FQVList%d  %.0fx%.0f\n"
+        @"-- BDRText 子树 --\n%@",
+        totalHooks(),
+        gEnabled ? @"ON " : @"OFF",
         gReaderActive ? @"YES" : @"NO",
-        w.bounds.size.width, w.bounds.size.height];
+        gHookCounts[0], gHookCounts[1], gHookCounts[2],
+        gHookCounts[3], gHookCounts[4],
+        w.bounds.size.width, w.bounds.size.height,
+        tree];
 
     if (![text isEqualToString:gLabel.text]) {
         gLabel.text = text;
@@ -290,10 +431,10 @@ static void tickLabel(void) {
 
 __attribute__((constructor))
 static void fixInit(void) {
-    // 延迟安装，确保主二进制与阅读器 framework 的类都已注册
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        installAllHooks();
+        for (int i = 0; i < HOOK_SLOTS; i++) installPair(i);
+        installReaderLifecycle();
         tickLabel();
         gTimer = [NSTimer scheduledTimerWithTimeInterval:0.5
                                                  repeats:YES
