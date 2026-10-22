@@ -308,58 +308,82 @@ static NSString *describeSubtree(UIView *root, int maxItems) {
     return [lines componentsJoinedByString:@"\n"];
 }
 
-// 视频：把播放层改成等比完整显示（等比缩放 + 居中由 layer 自己处理）
-static int fixVideoGravity(UIView *root, int depth) {
-    if (!root || depth > 9) return 0;
+// 视频：把整个 VC 的 view 等比缩放到窗口高度并居中。
+// 红果的竖版视频页原本不支持横屏，view 里没有任何横屏适配，
+// 强行旋转后仍是 375x812 的竖屏布局，只能整体缩放才能完整落在 812x375 里。
+static BOOL scaleVideoPage(UIWindow *w, UIViewController *vc) {
+    UIView *v = vc.view;
+    if (!v || v.bounds.size.height <= 1.0) return NO;
 
-    int fixed = 0;
-    Class playerLayerCls = NSClassFromString(@"AVPlayerLayer");
-    if (playerLayerCls && [root.layer isKindOfClass:playerLayerCls]) {
-        AVPlayerLayer *pl = (AVPlayerLayer *)root.layer;
-        if (![pl.videoGravity isEqualToString:AVLayerVideoGravityResizeAspect]) {
-            pl.videoGravity = AVLayerVideoGravityResizeAspect;
-            fixed++;
-        }
-    }
-    for (UIView *sub in root.subviews) {
-        fixed += fixVideoGravity(sub, depth + 1);
-    }
-    return fixed;
-}
+    CGFloat s = w.bounds.size.height / v.bounds.size.height;
+    if (s <= 0.05 || s >= 0.999) return NO;
 
-// 书本：把最宽文本视图撑到容器宽，触发内部重排
-static BOOL stretchReaderText(UIViewController *readerVC) {
-    if (!readerVC || !readerVC.view) return NO;
+    // 幂等：已经缩放到目标比例就不再动，避免每帧重设 transform
+    if (fabs(v.transform.a - s) < 0.02 && fabs(v.transform.d - s) < 0.02) return YES;
 
-    UIView *content = findViewByClassName(readerVC.view, @"BDRTextContentView", 0);
-    if (!content) return NO;
-
-    UIView *text = findLargestText(content, nil, 0);
-    if (!text) return NO;
-
-    CGFloat target = content.bounds.size.width;
-    if (target <= 1.0) return NO;
-    if (text.bounds.size.width >= target - 1.0) return NO;
-
-    CGRect f = text.frame;
-    f.size.width = target;
-    text.frame = f;
-    [text setNeedsLayout];
-    [text layoutIfNeeded];
+    CGAffineTransform t = CGAffineTransformMakeScale(s, s);
+    t.tx = (w.bounds.size.width - v.bounds.size.width * s) / 2.0;
+    t.ty = (w.bounds.size.height - v.bounds.size.height * s) / 2.0;
+    v.transform = t;
     return YES;
 }
+
+// 书本：定位 BDRTextView，让内部文字排版宽度跟随视图宽度
+static NSString *fixReaderText(UIViewController *readerVC) {
+    if (!readerVC || !readerVC.view) return @"no vc";
+
+    UIView *content = findViewByClassName(readerVC.view, @"BDRTextContentView", 0);
+    if (!content) return @"no content";
+
+    UIView *tv = findViewByClassName(content, @"BDRTextView", 0);
+    if (!tv) return @"no BDRTextView";
+
+    NSMutableString *info = [NSMutableString string];
+    [info appendFormat:@"%@ %.0fx%.0f",
+     NSStringFromClass([tv class]), tv.bounds.size.width, tv.bounds.size.height];
+
+    if ([tv isKindOfClass:[UITextView class]]) {
+        UITextView *utv = (UITextView *)tv;
+        [info appendFormat:@" tc%.0fx%.0f wtt%d",
+         utv.textContainer.size.width,
+         utv.textContainer.size.height,
+         utv.textContainer.widthTracksTextView ? 1 : 0];
+
+        utv.textContainer.widthTracksTextView = YES;
+        CGFloat usable = utv.bounds.size.width
+                         - utv.textContainerInset.left
+                         - utv.textContainerInset.right;
+        if (usable > 1.0) {
+            utv.textContainer.size = CGSizeMake(usable, CGFLOAT_MAX);
+        }
+        [utv setNeedsLayout];
+        [utv layoutIfNeeded];
+    } else if ([tv isKindOfClass:[UILabel class]]) {
+        UILabel *lbl = (UILabel *)tv;
+        [info appendFormat:@" LBL pmw%.0f", lbl.preferredMaxLayoutWidth];
+        lbl.preferredMaxLayoutWidth = tv.bounds.size.width;
+        [lbl setNeedsLayout];
+        [lbl layoutIfNeeded];
+    } else {
+        [info appendString:@" OTHER"];
+    }
+    return info;
+}
+
+static NSString *gReaderInfo = nil;
 
 static void applyExperimentalLayout(UIWindow *w) {
     if (!gExperimental || !gEnabled) return;
 
     UIViewController *videoVC = findVCContaining(w.rootViewController, @"FQVShortVideoList", 0);
     if (videoVC && videoVC.view) {
-        fixVideoGravity(videoVC.view, 0);
+        scaleVideoPage(w, videoVC);
     }
 
     UIViewController *reader = findVCContaining(w.rootViewController, @"BDRText", 0);
     if (reader) {
-        stretchReaderText(reader);
+        NSString *info = fixReaderText(reader);
+        if (![info isEqualToString:gReaderInfo]) gReaderInfo = info;
     }
 }
 
@@ -504,9 +528,10 @@ static void tickLabel(void) {
     NSString *videoTree = videoVC ? describeSubtree(videoVC.view, 5) : @"(不在视频页)";
 
     NSString *text = [NSString stringWithFormat:
-        @"RotateFix 0.4  tap:dim 2tap:on/off hold:exp\n"
+        @"RotateFix 0.5  tap:dim 2tap:on/off hold:exp\n"
         @"hook %d/10 %@ exp %@ reader %@\n"
         @"SSR%d BDR%d SLD%d TXT%d VID%d  %.0fx%.0f\n"
+        @"TXT %@\n"
         @"-- 书本 --\n%@\n"
         @"-- 视频 --\n%@",
         totalHooks(),
@@ -515,6 +540,7 @@ static void tickLabel(void) {
         gReaderActive ? @"Y" : @"N",
         gHookCounts[0], gHookCounts[1], gHookCounts[2], gHookCounts[3], gHookCounts[4],
         w.bounds.size.width, w.bounds.size.height,
+        gReaderInfo ?: @"-",
         readerTree, videoTree];
 
     if (![text isEqualToString:gLabel.text]) {
