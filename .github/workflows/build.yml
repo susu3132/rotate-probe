@@ -1,0 +1,67 @@
+name: build-rotateprobe
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK = $SDK"
+          echo "SDK_VERSION = $(xcrun --sdk iphoneos --show-sdk-version)"
+
+      - name: Compile dylib
+        run: |
+          set -euo pipefail
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          mkdir -p out
+
+          xcrun --sdk iphoneos clang \
+            -dynamiclib \
+            -arch arm64 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=15.0 \
+            -fobjc-arc \
+            -O2 \
+            -Wall \
+            -Wno-deprecated-declarations \
+            -Wno-unused-function \
+            -framework UIKit \
+            -framework Foundation \
+            -install_name @rpath/RotateProbe.dylib \
+            -o out/RotateProbe.dylib \
+            src/RotateProbe.m
+
+      - name: Ad-hoc sign and verify
+        run: |
+          set -euo pipefail
+          codesign --force --sign - --timestamp=none out/RotateProbe.dylib
+
+          echo "--- lipo ---"
+          lipo -info out/RotateProbe.dylib
+
+          echo "--- linked libraries (must NOT contain substrate) ---"
+          otool -L out/RotateProbe.dylib
+
+          echo "--- codesign ---"
+          codesign -dv out/RotateProbe.dylib 2>&1 || true
+
+          echo "--- size ---"
+          ls -lh out/RotateProbe.dylib
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RotateProbe-dylib
+          path: out/RotateProbe.dylib
+          if-no-files-found: error
